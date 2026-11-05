@@ -1,0 +1,9 @@
+﻿.dev-context/
+.DS_Store
+*.swp
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+.terraform.lock.hcl
