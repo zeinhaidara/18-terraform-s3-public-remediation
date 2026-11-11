@@ -1,4 +1,4 @@
-# Public S3 bucket detection and remediation
+# Public S3 bucket auto-remediation
 
 Terraform module that wires up AWS Config to detect publicly readable or writable S3
 buckets and, optionally, remediate them automatically by re-enabling S3 Block Public
