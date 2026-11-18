@@ -1,116 +1,126 @@
 # Public S3 bucket auto-remediation
 
-Terraform module that wires up AWS Config to detect publicly readable or writable S3
-buckets and, optionally, remediate them automatically by re-enabling S3 Block Public
-Access on the offending bucket.
+Terraform module that uses AWS Config to detect publicly readable or writable S3 buckets
+and, optionally, remediate them by enabling S3 Block Public Access on the offending bucket.
 
-**Scope:** AWS only (the source problem statement also mentions Azure Blob containers
-with Azure Policy - that half is out of scope here). This module also assumes an AWS
-Config configuration recorder and delivery channel are already enabled in the account;
-it does not create them. No live AWS account is used to test this repo - correctness is
-checked with `terraform validate` and the native Terraform test framework against a
-mocked AWS provider.
-
-## Problem
-
-S3 buckets occasionally end up publicly readable or writable through a bucket policy or
-ACL misconfiguration. This module turns that into something AWS Config watches
-continuously, instead of relying on a point-in-time audit.
-
-## Flow
+## How it works
 
 ```mermaid
 flowchart LR
-  A[S3 bucket policy/ACL changes] --> B[AWS Config evaluates rule]
-  B -->|compliant| C[no action]
-  B -->|non-compliant| D[Config remediation configuration]
-  D --> E[SSM automation document]
-  E --> F[PutBucketPublicAccessBlock on the bucket]
+  A[Bucket policy / ACL change] --> B["AWS Config rules<br/>public-read / public-write prohibited"]
+  B -->|compliant| C[No action]
+  B -->|non-compliant| D{automatic_remediation?}
+  D -->|false| E[Report only<br/>visible in Config console / API]
+  D -->|true| F["Config remediation<br/>retries up to max attempts"]
+  F --> G["SSM Automation document<br/>ConfigureS3BucketPublicAccessBlock"]
+  G --> H["Assumes IAM role<br/>Get/PutBucketPublicAccessBlock"]
+  H --> I[Block Public Access = true on the bucket]
 ```
 
 ## What this module creates
 
-- Two AWS Config rules using the AWS-managed sources `S3_BUCKET_PUBLIC_READ_PROHIBITED`
-  and `S3_BUCKET_PUBLIC_WRITE_PROHIBITED`, scoped to `AWS::S3::Bucket`.
-- An IAM role that only SSM can assume, with just enough permission to read and write a
-  bucket's Block Public Access settings.
-- A remediation configuration per rule that points at the AWS-owned SSM document
-  `AWSConfigRemediation-EnableS3BucketPublicAccessBlock`, which turns on Block Public
-  Access for the non-compliant bucket.
+- Two AWS Config managed rules, `S3_BUCKET_PUBLIC_READ_PROHIBITED` and
+  `S3_BUCKET_PUBLIC_WRITE_PROHIBITED`, scoped to `AWS::S3::Bucket` (all buckets).
+- An IAM role assumable only by SSM Automation in this account.
+- One Config remediation configuration per rule, targeting the AWS-owned SSM document
+  `AWSConfigRemediation-ConfigureS3BucketPublicAccessBlock` with parameters
+  `AutomationAssumeRole` (the role above) and `BucketName` (`RESOURCE_ID`, the
+  non-compliant bucket).
 
 ## Prerequisites
 
-- An AWS account with AWS Config already recording `AWS::S3::Bucket` resources.
+- AWS Config configuration recorder and delivery channel already set up and recording
+  `AWS::S3::Bucket`. **This module does not create them.**
 - Terraform >= 1.9, AWS provider >= 5.0.
-- Permissions to create IAM roles, Config rules, and Config remediation configurations.
+- Permissions to create IAM roles, Config rules and Config remediation configurations.
 
 ## Usage
 
+Detect only (default): Config flags non-compliant buckets but changes nothing.
+
 ```hcl
 module "s3_public_remediation" {
-  source = "./"
-
-  automatic_remediation = true
-  exclusion_tag_key      = "config-exempt"
-  exclusion_tag_value    = "true"
+  source = "github.com/zeinhaidara/18-terraform-s3-public-remediation"
 }
 ```
 
-Or with the CLI directly, using the sample variables in `example.tfvars`:
+Automatic remediation:
 
-```sh
-terraform init
-terraform plan -var-file=example.tfvars
-terraform apply -var-file=example.tfvars
+```hcl
+module "s3_public_remediation" {
+  source = "github.com/zeinhaidara/18-terraform-s3-public-remediation"
+
+  automatic_remediation     = true
+  remediation_max_attempts  = 5
+  remediation_retry_seconds = 60
+}
 ```
 
-By default `automatic_remediation` is `false`: Config will flag non-compliant buckets
-but not touch them, until someone sets it to `true`.
+A sample variable file is in `example.tfvars`.
 
-## Exempting a bucket
+## Inputs
 
-Tag a bucket with the key/value configured in `exclusion_tag_key` /
-`exclusion_tag_value` (defaults to `config-exempt = true`) to keep it out of scope for
-both rules - useful for a bucket that is intentionally public, such as a static website
-bucket. Set `exclusion_tag_key = ""` to disable exemptions entirely and evaluate every
-bucket in the account.
+| Name | Description | Type | Default |
+|------|-------------|------|---------|
+| `automatic_remediation` | Remediate non-compliant buckets automatically instead of only reporting. | `bool` | `false` |
+| `remediation_max_attempts` | Max remediation attempts within the retry window before Config adds a remediation exception. Must be 1-25. Only used when `automatic_remediation = true`. | `number` | `5` |
+| `remediation_retry_seconds` | Retry window in seconds. Must be 1-2678000. Only used when `automatic_remediation = true`. | `number` | `60` |
+| `tags` | Tags applied to the IAM role. | `map(string)` | `{}` |
 
-## Variables
+## Outputs
 
-| Name                        | Description                                              | Default              |
-|-----------------------------|------------------------------------------------------------|---------------------|
-| `automatic_remediation`     | Auto-remediate instead of only flagging                   | `false`              |
-| `remediation_max_attempts`  | Max automatic remediation attempts                        | `5`                  |
-| `remediation_retry_seconds` | Seconds between remediation attempts                       | `60`                 |
-| `exclusion_tag_key`         | Tag key that exempts a bucket; empty disables exemptions   | `"config-exempt"`    |
-| `exclusion_tag_value`       | Tag value that exempts a bucket                            | `"true"`             |
-| `tags`                      | Tags applied to the remediation IAM role                   | `{}`                 |
+| Name | Description |
+|------|-------------|
+| `remediation_role_arn` | ARN of the IAM role SSM assumes to run the remediation document. |
+| `config_rule_names` | Names of the Config rules created by this module. |
 
-## Security considerations
+## IAM
 
-- The remediation IAM role trusts only the `ssm.amazonaws.com` service principal, not an
-  account or user, so it cannot be assumed outside the SSM automation flow.
-- The role's permissions are limited to `s3:GetBucketPublicAccessBlock` and
-  `s3:PutBucketPublicAccessBlock` - it cannot read bucket contents, change bucket
-  policies, or touch any other service.
-- Automatic remediation defaults to off. Turning it on changes production bucket
-  configuration without a human in the loop - review `remediation_max_attempts` and the
-  exemption tag before enabling it on an account with intentionally public buckets.
+- **Permissions:** exactly `s3:GetBucketPublicAccessBlock` and `s3:PutBucketPublicAccessBlock`.
+  These are what the document's steps call (`PutPublicAccessBlock`, then
+  `GetPublicAccessBlock` to verify). No object access, no bucket policy changes.
+- **Resource is `"*"`** because the buckets to remediate are unknown at plan time. The
+  blast radius is limited by the two actions, which only touch Block Public Access settings.
+- **Trust policy:** principal `ssm.amazonaws.com`, with `aws:SourceAccount` equal to the
+  current account and `aws:SourceArn` matching
+  `arn:<partition>:ssm:*:<account>:automation-execution/*` (confused-deputy protection).
 
-## Idempotency
+## Verification runbook (sandbox account only)
 
-- Config rules and remediation configurations are declarative Terraform resources - re-
-  applying with unchanged variables is a no-op.
-- The `AWSConfigRemediation-EnableS3BucketPublicAccessBlock` document only sets Block
-  Public Access flags to `true`; running it repeatedly against an already-compliant
-  bucket does not change its state or raise an error.
+1. Apply the module with `automatic_remediation = false`.
+2. Create a test bucket, disable its Block Public Access and make it public via ACL or policy.
+3. In the Config console, confirm both rules evaluate the bucket as `NON_COMPLIANT`.
+4. Set `automatic_remediation = true` and apply. Re-evaluate the rule, then watch the
+   remediation run under Systems Manager > Automation.
+5. Confirm all four Block Public Access flags are `true`:
+   `aws s3api get-public-access-block --bucket <bucket>`.
 
-## Status / known limits
+```text
+<PLACEHOLDER: paste real output from a sandbox run here. No live run has been done yet.>
+```
 
-- Not tested against a real AWS account or a live Config recorder - validated with
-  `terraform validate`, `terraform fmt`, and `terraform test` against a mocked provider
-  only.
-- Assumes the Config recorder and delivery channel already exist; this module does not
-  create them.
-- Azure Blob container detection/remediation from the original problem statement is not
-  implemented.
+## Limitations
+
+- **No tag-based exemption.** AWS Config rule scope `tag_key`/`tag_value` *includes only*
+  resources with that tag; it cannot exclude them, so an earlier version of this module
+  that used it evaluated only the exempt buckets. The feature was removed. To stop
+  remediation for a specific bucket, add a Config remediation exception, for example
+  `aws configservice put-remediation-exceptions` (resource type `AWS::S3::Bucket`, with
+  the bucket name as resource ID). This is not managed by this module.
+- **Account-level S3 Block Public Access is not configured.** Setting it is an optional
+  follow-up (see AWS document `AWSConfigRemediation-ConfigureS3PublicAccessBlock` or the
+  `aws_s3_account_public_access_block` resource).
+- Config evaluates after a change is recorded, not instantly; there is a delay between a
+  bucket becoming public and remediation.
+- Azure Blob containers are not covered (AWS only).
+- Automatic remediation changes bucket settings with no human in the loop. Buckets that
+  are intentionally public (e.g. static websites) will be locked down.
+- The remediation document waits a stabilization period (default 300 s) before its final check.
+
+## Testing status
+
+- Run: `terraform fmt -check`, `terraform validate`, `terraform test` (mocked AWS provider,
+  no AWS calls) and, in CI, tflint and a Trivy config scan.
+- The SSM document's definition and Config API limits were checked read-only against AWS.
+- **Not run:** any live deployment. Config evaluation, the remediation execution, and the
+  trust policy's `aws:SourceArn` format have not been exercised against a real account.
