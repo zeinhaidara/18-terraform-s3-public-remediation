@@ -1,8 +1,17 @@
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
 
-# assumes an AWS Config configuration recorder is already enabled in the account
+# Assumes an AWS Config configuration recorder and delivery channel already exist and
+# record AWS::S3::Bucket. This module does not create them.
 locals {
-  remediation_document = "AWSConfigRemediation-EnableS3BucketPublicAccessBlock"
+  # AWS-owned SSM Automation document (bucket-level Block Public Access). Parameters:
+  # BucketName, AutomationAssumeRole, plus optional Block*/Restrict* flags (default true).
+  remediation_document = "AWSConfigRemediation-ConfigureS3BucketPublicAccessBlock"
+
+  # Retry settings are only sent when automatic remediation is on; they have no meaning
+  # for report-only mode.
+  max_attempts  = var.automatic_remediation ? var.remediation_max_attempts : null
+  retry_seconds = var.automatic_remediation ? var.remediation_retry_seconds : null
 }
 
 resource "aws_iam_role" "remediation" {
@@ -15,6 +24,15 @@ resource "aws_iam_role" "remediation" {
       Effect    = "Allow"
       Principal = { Service = "ssm.amazonaws.com" }
       Action    = "sts:AssumeRole"
+      # Confused-deputy protection: only SSM Automation executions in this account.
+      Condition = {
+        StringEquals = {
+          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+        }
+        ArnLike = {
+          "aws:SourceArn" = "arn:${data.aws_partition.current.partition}:ssm:*:${data.aws_caller_identity.current.account_id}:automation-execution/*"
+        }
+      }
     }]
   })
 }
@@ -23,6 +41,8 @@ resource "aws_iam_role_policy" "remediation" {
   name = "s3-public-access-block"
   role = aws_iam_role.remediation.id
 
+  # Resource "*" is deliberate: the buckets to remediate are not known at plan time, and
+  # the two actions only read/write Block Public Access settings (no object access).
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -46,8 +66,6 @@ resource "aws_config_config_rule" "s3_public_read_prohibited" {
 
   scope {
     compliance_resource_types = ["AWS::S3::Bucket"]
-    tag_key                   = var.exclusion_tag_key != "" ? var.exclusion_tag_key : null
-    tag_value                 = var.exclusion_tag_key != "" ? var.exclusion_tag_value : null
   }
 }
 
@@ -61,8 +79,6 @@ resource "aws_config_config_rule" "s3_public_write_prohibited" {
 
   scope {
     compliance_resource_types = ["AWS::S3::Bucket"]
-    tag_key                   = var.exclusion_tag_key != "" ? var.exclusion_tag_key : null
-    tag_value                 = var.exclusion_tag_key != "" ? var.exclusion_tag_value : null
   }
 }
 
@@ -73,8 +89,8 @@ resource "aws_config_remediation_configuration" "s3_public_read_prohibited" {
   target_id        = local.remediation_document
 
   automatic                  = var.automatic_remediation
-  maximum_automatic_attempts = var.remediation_max_attempts
-  retry_attempt_seconds      = var.remediation_retry_seconds
+  maximum_automatic_attempts = local.max_attempts
+  retry_attempt_seconds      = local.retry_seconds
 
   parameter {
     name         = "AutomationAssumeRole"
@@ -94,8 +110,8 @@ resource "aws_config_remediation_configuration" "s3_public_write_prohibited" {
   target_id        = local.remediation_document
 
   automatic                  = var.automatic_remediation
-  maximum_automatic_attempts = var.remediation_max_attempts
-  retry_attempt_seconds      = var.remediation_retry_seconds
+  maximum_automatic_attempts = local.max_attempts
+  retry_attempt_seconds      = local.retry_seconds
 
   parameter {
     name         = "AutomationAssumeRole"
