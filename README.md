@@ -3,6 +3,10 @@
 Terraform module that uses AWS Config to detect publicly readable or writable S3 buckets
 and, optionally, remediate them by enabling S3 Block Public Access on the offending bucket.
 
+Why it matters: a bucket made public by a policy or ACL change can expose data within minutes,
+and nobody may notice until it is found from outside. Config flags it, and remediation can
+lock it down without waiting for a person.
+
 ## How it works
 
 ```mermaid
@@ -95,9 +99,7 @@ A sample variable file is in `example.tfvars`.
 5. Confirm all four Block Public Access flags are `true`:
    `aws s3api get-public-access-block --bucket <bucket>`.
 
-```text
-<PLACEHOLDER: paste real output from a sandbox run here. No live run has been done yet.>
-```
+No sandbox run has been done yet, so there is no real output to show here.
 
 ## Limitations
 
@@ -120,7 +122,14 @@ A sample variable file is in `example.tfvars`.
 ## Testing status
 
 - Run: `terraform fmt -check`, `terraform validate`, `terraform test` (mocked AWS provider,
-  no AWS calls) and, in CI, tflint and a Trivy config scan.
+  no AWS calls) and, in CI, tflint and a Trivy config scan. Locally:
+
+  ```bash
+  terraform fmt -check -recursive
+  terraform init -backend=false
+  terraform validate
+  terraform test
+  ```
 - The SSM document's definition and Config API limits were checked read-only against AWS.
 - **Not run:** any live deployment. Config evaluation, the remediation execution, and the
   trust policy's `aws:SourceArn` format have not been exercised against a real account.
